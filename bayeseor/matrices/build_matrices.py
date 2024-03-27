@@ -483,6 +483,7 @@ class BuildMatrices(BuildMatrixTree):
 
         if self.include_instrumental_effects:
             self.uvw_array_m = kwargs.pop('uvw_array_m')
+            self.nbls = self.uvw_array_m.shape[1]
             self.bl_red_array = kwargs.pop('bl_red_array')
             self.bl_red_array_vec = kwargs.pop('bl_red_array_vec')
             self.phasor_vec = kwargs.pop('phasor_vec', None)
@@ -1826,6 +1827,35 @@ class BuildMatrices(BuildMatrixTree):
         start = time.time()
         print('Performing matrix algebra')
         T = self.dot_product(pmd['Finv'], pmd['Fprime_Fz'])
+        # Finv is a stack of block diagonal matrices.  Each component of the
+        # stack encodes the sky --> visibilities transformation at a single
+        # time.  If we treat Finv as a sparse matrix, we use scipy's sparse
+        # dot product which is limited to a single core/thread.  Numpy's dot
+        # product is typically configured for threading.  If we have more than
+        # 1 thread available, it's much faster to do a dense-dense dot product.
+        # Finv has a lot of zeros, though, so it's inefficient in terms of
+        # memory to cast it as a single dense matrix.  Instead, it's more
+        # efficient in time and memory to add a couple for loops and multiply
+        # the dense block diagonals of Finv times the corresponding components
+        # in Fprime_Fz.
+        T = np.zeros(
+            (self.nt, self.nbls * self.nf, Fprime_Fz.shape[1]),
+            dtype=complex
+        )
+        for i_t in range(self.nt):
+            for i_f in range(self.nf):
+                blt_slice = slice(
+                    i_t*self.nbls*self.nf + i_f*self.nbls,
+                    i_t*self.nbls*self.nf + (i_f + 1)*self.nbls
+                )
+                pix_slice = slice(
+                    i_f*self.hpx.npix_fov, (i_f + 1)*self.hpx.npix_fov
+                )
+                T[i_t, blt_slice] = np.dot(
+                    pmd['Finv'][blt_slice, pix_slice].todense(),
+                    pmd['Fprime_Fz'][pix_slice]
+                )
+        T = np.vstack(T)
         print('Time taken: {}'.format(time.time() - start))
         # Save matrix to HDF5 or sparse matrix to npz
         self.output_data(
